@@ -1,0 +1,30 @@
+def chunked_query(cursor, meter_ids, chunk_size=999):
+    all_results = []
+    for i in range(0, len(meter_ids), chunk_size):
+        chunk = meter_ids[i:i + chunk_size]
+        id_list = ", ".join(str(m) for m in chunk)
+        query = f"""
+            SELECT *
+            FROM your_table
+            WHERE meter_id IN ({id_list})
+        """
+        cursor.execute(query)
+        all_results.extend(cursor.fetchall())
+    return all_results
+
+cursor = edw_conn.cursor()
+results = chunked_query(cursor, meter_ids)
+
+cursor = edw_conn.cursor()
+# Run one chunk first just to get column names
+chunk = meter_ids[:999]
+id_list = ", ".join(str(m) for m in chunk)
+query = f"SELECT * FROM your_table WHERE meter_id IN ({id_list})"
+cursor.execute(query)
+columns = [col[0] for col in cursor.description]
+
+# Now run the full chunked query
+results = chunked_query(cursor, meter_ids)
+df_results = pd.DataFrame(results, columns=columns)
+
+
