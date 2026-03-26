@@ -1,8 +1,18 @@
 from tableauhyperapi import HyperProcess, Telemetry, Connection, TableDefinition, SqlType, Inserter, CreateMode
 import pandas as pd
+import os
 
-# your parquet file
-df = pd.read_parquet("meter_analysis.parquet")
+# your parquet file path (FULL PATH recommended)
+parquet_path = r"C:\data\meter_analysis.parquet"
+
+# read parquet
+df = pd.read_parquet(parquet_path)
+
+# 🔥 get same directory as parquet
+output_dir = os.path.dirname(parquet_path)
+
+# 🔥 build hyper path in same folder
+hyper_path = os.path.join(output_dir, "meter_analysis.hyper")
 
 # define table schema
 table = TableDefinition(
@@ -11,14 +21,13 @@ table = TableDefinition(
         TableDefinition.Column("col1", SqlType.text()),
         TableDefinition.Column("col2", SqlType.text()),
         TableDefinition.Column("col3", SqlType.double()),
-        # add your columns here
     ]
 )
 
 with HyperProcess(Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
     with Connection(
         endpoint=hyper.endpoint,
-        database="meter_analysis.hyper",
+        database=hyper_path,   # 👈 THIS is the key change
         create_mode=CreateMode.CREATE_AND_REPLACE
     ) as connection:
 
