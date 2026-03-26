@@ -1,0 +1,30 @@
+from tableauhyperapi import HyperProcess, Telemetry, Connection, TableDefinition, SqlType, Inserter, CreateMode
+import pandas as pd
+
+# your parquet file
+df = pd.read_parquet("meter_analysis.parquet")
+
+# define table schema
+table = TableDefinition(
+    table_name="Extract.Extract",
+    columns=[
+        TableDefinition.Column("col1", SqlType.text()),
+        TableDefinition.Column("col2", SqlType.text()),
+        TableDefinition.Column("col3", SqlType.double()),
+        # add your columns here
+    ]
+)
+
+with HyperProcess(Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
+    with Connection(
+        endpoint=hyper.endpoint,
+        database="meter_analysis.hyper",
+        create_mode=CreateMode.CREATE_AND_REPLACE
+    ) as connection:
+
+        connection.catalog.create_schema("Extract")
+        connection.catalog.create_table(table)
+
+        with Inserter(connection, table) as inserter:
+            inserter.add_rows(df.itertuples(index=False, name=None))
+            inserter.execute()
