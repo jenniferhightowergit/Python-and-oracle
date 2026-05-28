@@ -1,0 +1,69 @@
+import duckdb
+import pandas as pd
+
+con = duckdb.connect()
+
+# daily_events = full meter/date table
+# ncm_agg = your NCM aggregate table, one row per NCM event
+con.register("daily_events", daily_events_df)
+con.register("ncm_agg", ncm_agg_df)
+
+target_non_ncm_ratio = 70 / 30
+
+sql = f"""
+WITH ncm_rows AS (
+    SELECT
+        *,
+        1 AS target_flag
+    FROM ncm_agg
+),
+
+ncm_counts AS (
+    SELECT
+        ncm_date,
+        zip_code,
+        COUNT(*) AS ncm_count,
+        CEIL(COUNT(*) * {target_non_ncm_ratio}) AS non_ncm_sample_needed
+    FROM ncm_rows
+    GROUP BY
+        ncm_date,
+        zip_code
+),
+
+non_ncm_candidates AS (
+    SELECT
+        d.*,
+        c.ncm_count,
+        c.non_ncm_sample_needed,
+        ROW_NUMBER() OVER (
+            PARTITION BY d.event_date, d.zip_code
+            ORDER BY RANDOM()
+        ) AS random_rank
+    FROM daily_events d
+    INNER JOIN ncm_counts c
+        ON d.event_date = c.ncm_date
+        AND d.zip_code = c.zip_code
+    WHERE COALESCE(d.ncm_flag, 0) = 0
+),
+
+sampled_non_ncm AS (
+    SELECT
+        *,
+        0 AS target_flag
+    FROM non_ncm_candidates
+    WHERE random_rank <= non_ncm_sample_needed
+)
+
+SELECT * FROM ncm_rows
+
+UNION ALL
+
+SELECT
+    -- choose same columns as ncm_rows
+    meter_id,
+    event_date AS ncm_date,
+    zip_code,
+    0 AS ncm_flag,
+    target_flag
+FROM sampled_non_ncm
+"""
