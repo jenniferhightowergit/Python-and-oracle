@@ -1,0 +1,74 @@
+import pandas as pd
+
+df = daily_events.copy()
+
+meter_col = "meter_id"
+date_col = "event_date"
+
+df[date_col] = pd.to_datetime(df[date_col])
+
+df = df.sort_values([meter_col, date_col]).copy()
+
+
+exclude_cols = {
+    "meter_id",
+    "event_date",
+    "zip_code",
+    "ncm_flag",
+    "mc_flag",
+    "estimate_flag"   # keep this separate
+}
+
+event_cols = [
+    c for c in df.columns
+    if c not in exclude_cols
+    and pd.api.types.is_numeric_dtype(df[c])
+]
+
+event_cols
+
+
+windows = [7, 30]
+
+new_features = {}
+
+for col in event_cols:
+    for window in windows:
+        new_col = f"{col}_{window}d_prior"
+
+        new_features[new_col] = (
+            df.groupby(meter_col)[col]
+              .transform(lambda s: s.shift(1).rolling(window, min_periods=1).sum())
+        )
+
+df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
+
+
+estimate_col = "estimate_flag"
+
+def max_streak_prior_window(s, window):
+    shifted = s.shift(1).fillna(0)
+
+    def max_consecutive_ones(x):
+        max_run = 0
+        current_run = 0
+
+        for val in x:
+            if val == 1:
+                current_run += 1
+                max_run = max(max_run, current_run)
+            else:
+                current_run = 0
+
+        return max_run
+
+    return shifted.rolling(window, min_periods=1).apply(max_consecutive_ones, raw=False)
+
+
+for window in windows:
+    df[f"max_estimate_streak_{window}d_prior"] = (
+        df.groupby(meter_col)[estimate_col]
+          .transform(lambda s: max_streak_prior_window(s, window))
+    )
+
+
