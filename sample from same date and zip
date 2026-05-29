@@ -1,0 +1,80 @@
+
+
+import pandas as pd
+
+# -----------------------------
+# 1. Basic setup
+# -----------------------------
+
+df = df.copy()
+
+df["event_date"] = pd.to_datetime(df["event_date"])
+
+# all meters that ever had an NCM
+ncm_meter_ids = df.loc[df["ncm_flag"] == 1, "meter_id"].unique()
+
+# NCM case rows
+ncm_rows = df[df["ncm_flag"] == 1].copy()
+ncm_rows["sample_group"] = "ncm"
+
+# rows from meters that NEVER had an NCM
+non_ncm_pool = df[~df["meter_id"].isin(ncm_meter_ids)].copy()
+non_ncm_pool = non_ncm_pool[non_ncm_pool["ncm_flag"] == 0].copy()
+
+
+
+
+Sample 1: match on same date + same ZIP
+
+sample_date_zip = (
+    ncm_rows[["event_date", "zip_code"]]
+    .drop_duplicates()
+    .merge(
+        non_ncm_pool,
+        on=["event_date", "zip_code"],
+        how="inner"
+    )
+)
+
+# randomly pick one matching non-NCM row per NCM date/ZIP combo
+sample_date_zip = (
+    sample_date_zip
+    .groupby(["event_date", "zip_code"], group_keys=False)
+    .sample(n=1, random_state=42)
+)
+
+sample_date_zip["sample_group"] = "non_ncm_date_zip"
+
+
+
+sample_date_zip_model = (
+    ncm_rows[["event_date", "zip_code", "hardware_model"]]
+    .drop_duplicates()
+    .merge(
+        non_ncm_pool,
+        on=["event_date", "zip_code", "hardware_model"],
+        how="inner"
+    )
+)
+
+sample_date_zip_model = (
+    sample_date_zip_model
+    .groupby(["event_date", "zip_code", "hardware_model"], group_keys=False)
+    .sample(n=1, random_state=42)
+)
+
+sample_date_zip_model["sample_group"] = "non_ncm_date_zip_model"
+
+
+final_sample = pd.concat(
+    [
+        ncm_rows,
+        sample_date_zip,
+        sample_date_zip_model
+    ],
+    ignore_index=True
+)
+
+
+
+
