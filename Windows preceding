@@ -1,3 +1,71 @@
+
+from 1
+
+import pandas as pd
+import numpy as np
+
+df = df.copy()
+df["event_date"] = pd.to_datetime(df["event_date"])
+
+df = df.sort_values(["meter_id", "event_date"]).reset_index(drop=True)
+
+# rows where you want prior-window features calculated
+target_rows = df[df["ncm_flag"] == 1].copy()
+
+windows = [7, 30]
+
+results = []
+
+for idx, row in target_rows.iterrows():
+
+    meter = row["meter_id"]
+    event_date = row["event_date"]
+
+    meter_history = df[
+        (df["meter_id"] == meter) &
+        (df["event_date"] < event_date)
+    ].sort_values("event_date")
+
+    output_row = row.copy()
+
+    for window in windows:
+        prior_window = meter_history.tail(window)
+
+        for col in rolling_cols:
+            output_row[f"{col}_{window}d_prior"] = prior_window[col].sum()
+
+        # estimate max streak
+        flags = prior_window["estimate_flag"].fillna(0).tolist()
+
+        max_run = 0
+        run = 0
+
+        for v in flags:
+            if v == 1:
+                run += 1
+                max_run = max(max_run, run)
+            else:
+                run = 0
+
+        output_row[f"estimate_max_streak_{window}d_prior"] = max_run
+
+    results.append(output_row)
+
+ncm_rows_with_features = pd.DataFrame(results)
+
+
+
+
+
+
+
+
+
+
+
+
+
+every row
 windows = [7, 30]
 
 new_features = {}
