@@ -1,0 +1,65 @@
+DuckDB is good for this because it can read/write parquet and supports MERGE INTO for upsert logic.
+
+
+
+TABLE_CONFIGS = {
+    "work_orders": {
+        "source_query": """
+            SELECT *
+            FROM work_orders
+            WHERE last_modified_date >= CURRENT_DATE - 30
+        """,
+        "target_path": r"//sharedrive/staging/work_orders.parquet",
+        "key_cols": ["work_order_id"],
+        "compare_cols": ["status", "completed_date", "assigned_to", "last_modified_date"]
+    }
+}
+
+
+
+generic function
+
+
+def incremental_upsert(config):
+    import duckdb
+
+    con = duckdb.connect()
+
+    target_path = config["target_path"]
+    key_cols = config["key_cols"]
+
+    # existing parquet
+    con.execute(f"""
+        CREATE OR REPLACE TABLE target AS
+        SELECT * FROM read_parquet('{target_path}')
+    """)
+
+    # new/recent extract dataframe from Oracle
+    source_df = get_oracle_data(config["source_query"])
+
+    con.register("source_df", source_df)
+
+    con.execute("""
+        CREATE OR REPLACE TABLE source AS
+        SELECT * FROM source_df
+    """)
+
+    join_condition = " AND ".join(
+        [f"target.{col} = source.{col}" for col in key_cols]
+    )
+
+    con.execute(f"""
+        MERGE INTO target
+        USING source
+        ON {join_condition}
+        WHEN MATCHED THEN UPDATE SET *
+        WHEN NOT MATCHED THEN INSERT *
+    """)
+
+    con.execute(f"""
+        COPY target TO '{target_path}' (FORMAT PARQUET)
+    """)
+
+
+
+    incremental_upsert(TABLE_CONFIGS["work_orders"])
