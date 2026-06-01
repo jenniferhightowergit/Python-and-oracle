@@ -1,38 +1,39 @@
-
-from 1
-
-import pandas as pd
-import numpy as np
-
-df = df.copy()
-df["event_date"] = pd.to_datetime(df["event_date"])
-
-df = df.sort_values(["meter_id", "event_date"]).reset_index(drop=True)
-
-# rows where you want prior-window features calculated
-target_rows = df[df["ncm_flag"] == 1].copy()
-
 windows = [7, 30]
 
 results = []
 
+# remove estimate_flag from normal summed rolling columns
+sum_cols = [c for c in rolling_cols if c != "estimate_flag"]
+
 for idx, row in target_rows.iterrows():
 
     meter = row["meter_id"]
-    event_date = row["event_date"]
+    ncm_date = row["event_date"]
 
     meter_history = df[
         (df["meter_id"] == meter) &
-        (df["event_date"] < event_date)
+        (df["event_date"] < ncm_date)
     ].sort_values("event_date")
 
     output_row = row.copy()
 
     for window in windows:
-        prior_window = meter_history.tail(window)
 
-        for col in rolling_cols:
+        start_date = ncm_date - pd.Timedelta(days=window)
+
+        prior_window = meter_history[
+            (meter_history["event_date"] >= start_date) &
+            (meter_history["event_date"] < ncm_date)
+        ]
+
+        # normal event columns get summed
+        for col in sum_cols:
             output_row[f"{col}_{window}d_prior"] = prior_window[col].sum()
+
+        # estimate_flag gets MAX, not SUM
+        output_row[f"estimate_flag_{window}d_prior"] = (
+            prior_window["estimate_flag"].fillna(0).max()
+        )
 
         # estimate max streak
         flags = prior_window["estimate_flag"].fillna(0).tolist()
@@ -52,68 +53,3 @@ for idx, row in target_rows.iterrows():
     results.append(output_row)
 
 ncm_rows_with_features = pd.DataFrame(results)
-
-
-
-
-
-
-
-
-
-
-
-
-
-every row
-windows = [7, 30]
-
-new_features = {}
-
-for col in rolling_cols:
-
-    grouped = df.groupby("meter_id")[col]
-
-    for window in windows:
-
-        feature_name = f"{col}_{window}d_prior"
-
-        new_features[feature_name] = (
-            grouped.transform(
-                lambda x:
-                x.shift(1)
-                 .rolling(window, min_periods=1)
-                 .sum()
-            )
-        )
-
-df = pd.concat(
-    [df, pd.DataFrame(new_features)],
-    axis=1
-)
-
-
-
-def max_streak(x):
-    max_run = run = 0
-
-    for v in x:
-        if v == 1:
-            run += 1
-            max_run = max(max_run, run)
-        else:
-            run = 0
-
-    return max_run
-
-for window in [7,30]:
-
-    df[f"estimate_max_streak_{window}d_prior"] = (
-        df.groupby("meter_id")["estimate_flag"]
-          .transform(
-              lambda x:
-              x.shift(1)
-               .rolling(window, min_periods=1)
-               .apply(max_streak)
-          )
-    )
