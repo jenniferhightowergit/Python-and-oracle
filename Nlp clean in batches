@@ -94,4 +94,37 @@ batch_preprocess(
     id_col="WORK_ORDER_ID",
     comment_col="TECH_COMMENT",
     batch_size=10_000
+
+
+
 )
+
+
+for start in range(0, total_rows, BATCH_SIZE):
+    end = min(start + BATCH_SIZE, total_rows)
+    print(f"\nStarting batch rows {start:,} to {end:,}...")
+
+    try:
+        batch = df.iloc[start:end].copy()
+        print(f"  Batch loaded: {len(batch):,} rows")
+
+        # Your cleaning code here
+        batch["cleaned_comment"] = batch[COMMENT_COL].str.lower().str.strip()
+        print(f"  Cleaning done. Columns: {batch.columns.tolist()}")
+
+        output_batch = batch[[WORK_ORDER_ID_COL, COMMENT_COL, "cleaned_comment"]]
+        print(f"  Output batch shape: {output_batch.shape}")
+
+        table = pa.Table.from_pandas(output_batch, preserve_index=False)
+        if writer is None:
+            writer = pq.ParquetWriter(OUTPUT_FILE, table.schema)
+            print("  Writer created (first batch)")
+        writer.write_table(table)
+        print(f"  ✓ Batch written successfully")
+
+    except Exception as e:
+        print(f"  ✗ BATCH FAILED at rows {start:,} to {end:,}")
+        print(f"  Error: {e}")
+        import traceback
+        traceback.print_exc()  # prints the full error with line numbers
+
