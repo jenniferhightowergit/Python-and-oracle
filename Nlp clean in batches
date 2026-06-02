@@ -1,56 +1,97 @@
 import pandas as pd
-from itertools import product
+import pyarrow as pa
+import pyarrow.parquet as pq
+import re
 
-def run_preprocessing_by_month(df, date_col, preprocess_fn, output_dir="output"):
-    """
-    Runs your preprocessing function on df split by year/month.
-    
-    df           - your full dataframe
-    date_col     - name of the datetime column (e.g. 'WORK_ORDER_DATE')
-    preprocess_fn - your existing preprocessing function that takes a df
-    output_dir   - where to save each batch result
-    """
-    import os
-    os.makedirs(output_dir, exist_ok=True)
+def batch_preprocess(
+    input_parquet,
+    output_parquet,
+    id_col,
+    comment_col,
+    batch_size=10_000
+):
+    print(f"Loading {input_parquet}...")
+    df = pd.read_parquet(input_parquet, columns=[id_col, comment_col])
+    total = len(df)
+    print(f"Total rows: {total:,}")
 
-    # Make sure the date column is parsed
-    df[date_col] = pd.to_datetime(df[date_col])
-    df["_year"]  = df[date_col].dt.year
-    df["_month"] = df[date_col].dt.month
+    writer = None  # ParquetWriter will be opened on the first batch
 
-    batches = df[["_year", "_month"]].drop_duplicates().sort_values(["_year", "_month"])
-
-    for _, row in batches.iterrows():
-        year, month = int(row["_year"]), int(row["_month"])
-        batch_label = f"{year}_{month:02d}"
-        print(f"Processing batch: {batch_label} ...", end=" ")
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        print(f"Processing rows {start:,}–{end:,} ...", end=" ", flush=True)
 
         try:
-            mask = (df["_year"] == year) & (df["_month"] == month)
-            batch_df = df[mask].drop(columns=["_year", "_month"]).copy()
+            batch = df.iloc[start:end].copy()
 
-            result = preprocess_fn(batch_df)  # <-- your existing function
+            # ----------------------------------------------------------------
+            # COMMENT CLEANING STARTS HERE
+            # Replace everything below with your actual preprocessing steps
+            # ----------------------------------------------------------------
 
-            out_path = os.path.join(output_dir, f"preprocessed_{batch_label}.parquet")
-            result.to_parquet(out_path, index=False)
-            print(f"✓ saved {len(result)} rows → {out_path}")
+            # Lowercase
+            batch["cleaned_comment"] = batch[comment_col].str.lower()
+
+            # Strip leading/trailing whitespace
+            batch["cleaned_comment"] = batch["cleaned_comment"].str.strip()
+
+            # Remove special characters, keep letters/numbers/spaces
+            batch["cleaned_comment"] = batch["cleaned_comment"].apply(
+                lambda x: re.sub(r"[^a-z0-9\s]", "", str(x)) if pd.notna(x) else x
+            )
+
+            # Collapse multiple spaces into one
+            batch["cleaned_comment"] = batch["cleaned_comment"].apply(
+                lambda x: re.sub(r"\s+", " ", str(x)) if pd.notna(x) else x
+            )
+
+            # Replace blanks/nulls that slipped through with NaN
+            batch["cleaned_comment"] = batch["cleaned_comment"].replace("", pd.NA)
+
+            # ----------------------------------------------------------------
+            # COMMENT CLEANING ENDS HERE
+            # ----------------------------------------------------------------
+
+            # Keep only the ID and cleaned comment for output
+            result = batch[[id_col, "cleaned_comment"]]
+
+            # ----------------------------------------------------------------
+            # APPEND TO PARQUET STARTS HERE
+            # Each batch gets written to the output parquet file here.
+            # The ParquetWriter keeps the file open and appends each batch
+            # as a new row group — no temp files, no concat at the end.
+            # ----------------------------------------------------------------
+
+            table = pa.Table.from_pandas(result, preserve_index=False)
+
+            if writer is None:
+                # First batch — open the writer and define the file schema
+                writer = pq.ParquetWriter(output_parquet, table.schema)
+
+            writer.write_table(table)  # <-- this is where the batch gets appended
+
+            # ----------------------------------------------------------------
+            # APPEND TO PARQUET ENDS HERE
+            # ----------------------------------------------------------------
+
+            print(f"✓ {len(result):,} rows appended")
 
         except Exception as e:
             print(f"✗ FAILED — {e}")
-            # Continues to next batch instead of crashing everything
+            # Bad batch gets logged and skipped; rest of the run continues
 
-    print("\nAll batches complete.")
+    if writer:
+        writer.close()  # Finalizes and closes the parquet file
+        print(f"\nDone. Cleaned comments saved to: {output_parquet}")
+    else:
+        print("No data was written.")
 
-run_preprocessing_by_month(
-    df=your_full_df,
-    date_col="WORK_ORDER_DATE",   # swap for your actual column name
-    preprocess_fn=your_preprocess_fn
+
+# --- Run it ---
+batch_preprocess(
+    input_parquet="work_orders.parquet",
+    output_parquet="work_orders_cleaned.parquet",
+    id_col="WORK_ORDER_ID",
+    comment_col="TECH_COMMENT",
+    batch_size=10_000
 )
-
-
-import glob
-
-all_files = sorted(glob.glob("output/preprocessed_*.parquet"))
-combined = pd.concat([pd.read_parquet(f) for f in all_files], ignore_index=True)
-combined.to_parquet("output/preprocessed_all.parquet", index=False)
-
