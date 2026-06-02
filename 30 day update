@@ -1,65 +1,140 @@
-DuckDB is good for this because it can read/write parquet and supports MERGE INTO for upsert logic.
+import duckdb
+import pandas as pd
+import os
+import shutil
+from sqlalchemy import create_engine
 
 
+# ---------------------------------------
+# 1. Oracle connection
+# ---------------------------------------
+
+engine = create_engine(
+    "oracle+oracledb://user:password@host:port/service_name"
+)
+
+
+def get_oracle_data(query):
+    df = pd.read_sql(query, con=engine)
+    return df
+
+
+# ---------------------------------------
+# 2. Table configs
+# ---------------------------------------
 
 TABLE_CONFIGS = {
     "work_orders": {
         "source_query": """
             SELECT *
             FROM work_orders
-            WHERE last_modified_date >= CURRENT_DATE - 30
+            WHERE work_order_update_date >= SYSDATE - 60
         """,
+
         "target_path": r"//sharedrive/staging/work_orders.parquet",
+
         "key_cols": ["work_order_id"],
-        "compare_cols": ["status", "completed_date", "assigned_to", "last_modified_date"]
+
+        "incremental_col": "work_order_update_date",
+
+        "lookback_days": 60
     }
 }
 
 
-
-generic function
-
+# ---------------------------------------
+# 3. Incremental upsert function
+# ---------------------------------------
 
 def incremental_upsert(config):
-    import duckdb
 
     con = duckdb.connect()
 
+    # Optional memory controls
+    con.execute("SET memory_limit='4GB'")
+    con.execute("SET threads=2")
+
     target_path = config["target_path"]
     key_cols = config["key_cols"]
+    incremental_col = config["incremental_col"]
+    lookback_days = config["lookback_days"]
 
-    # existing parquet
-    con.execute(f"""
-        CREATE OR REPLACE TABLE target AS
-        SELECT * FROM read_parquet('{target_path}')
-    """)
+    temp_path = target_path.replace(".parquet", "_temp.parquet")
+    backup_path = target_path.replace(".parquet", "_backup.parquet")
 
-    # new/recent extract dataframe from Oracle
+    # ---------------------------------------
+    # Pull recent/changed rows from Oracle
+    # ---------------------------------------
+
     source_df = get_oracle_data(config["source_query"])
+
+    if source_df.empty:
+        print("No new source rows found.")
+        return
 
     con.register("source_df", source_df)
 
-    con.execute("""
-        CREATE OR REPLACE TABLE source AS
-        SELECT * FROM source_df
+    # ---------------------------------------
+    # Load ONLY the recent slice from existing parquet
+    # ---------------------------------------
+
+    con.execute(f"""
+        CREATE OR REPLACE TABLE target_recent AS
+        SELECT *
+        FROM read_parquet('{target_path}')
+        WHERE {incremental_col} >= CURRENT_DATE - INTERVAL '{lookback_days} days'
     """)
 
+    # ---------------------------------------
+    # Merge recent Oracle rows into recent parquet slice
+    # ---------------------------------------
+
     join_condition = " AND ".join(
-        [f"target.{col} = source.{col}" for col in key_cols]
+        [f"target_recent.{col} = source_df.{col}" for col in key_cols]
     )
 
     con.execute(f"""
-        MERGE INTO target
-        USING source
+        MERGE INTO target_recent
+        USING source_df
         ON {join_condition}
         WHEN MATCHED THEN UPDATE SET *
         WHEN NOT MATCHED THEN INSERT *
     """)
 
+    # ---------------------------------------
+    # Rebuild full parquet:
+    # old untouched history + updated recent slice
+    # ---------------------------------------
+
     con.execute(f"""
-        COPY target TO '{target_path}' (FORMAT PARQUET)
+        COPY (
+            SELECT *
+            FROM read_parquet('{target_path}')
+            WHERE {incremental_col} < CURRENT_DATE - INTERVAL '{lookback_days} days'
+
+            UNION ALL
+
+            SELECT *
+            FROM target_recent
+        )
+        TO '{temp_path}'
+        (FORMAT PARQUET)
     """)
 
+    # ---------------------------------------
+    # Safe file swap
+    # ---------------------------------------
+
+    shutil.copy2(target_path, backup_path)
+    os.replace(temp_path, target_path)
+
+    print("Incremental upsert complete.")
+    print(f"Updated file: {target_path}")
+    print(f"Backup file: {backup_path}")
 
 
-    incremental_upsert(TABLE_CONFIGS["work_orders"])
+# ---------------------------------------
+# 4. Run it
+# ---------------------------------------
+
+incremental_upsert(TABLE_CONFIGS["work_orders"])
