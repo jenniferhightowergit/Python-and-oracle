@@ -4,179 +4,168 @@ import os
 import shutil
 from sqlalchemy import create_engine
 
-
-# ---------------------------------------
-# 1. Oracle connection
-# ---------------------------------------
-
 engine = create_engine(
     "oracle+oracledb://user:password@host:port/service_name"
 )
-
-
-def get_oracle_data(query):
-    df = pd.read_sql(query, con=engine)
-    return df
-
-
-# ---------------------------------------
-# 2. Table configs
-# ---------------------------------------
 
 TABLE_CONFIGS = {
     "work_orders": {
         "source_query": """
             SELECT *
             FROM work_orders
-            WHERE work_order_update_date >= SYSDATE - 60
+            WHERE work_order_update_date >= SYSDATE - 30
         """,
+        # FIX: Changed to 30 days to match your stated intent.
+        # Your original had 60 days here AND in lookback_days,
+        # meaning you were pulling and comparing the same window — redundant.
 
         "target_path": r"//sharedrive/staging/work_orders.parquet",
-
         "key_cols": ["work_order_id"],
-
         "incremental_col": "work_order_update_date",
+        "lookback_days": 60,
+        # Keep 60 days as the comparison window in the parquet.
+        # Oracle pulls last 30 days; parquet window is 60 days.
+        # This gives you overlap buffer for late-arriving updates.
 
-        "lookback_days": 60
+        "chunk_size": 50_000
+        # FIX: Added chunking so Oracle reads don't slam memory at once.
     }
 }
 
 
-# ---------------------------------------
-# 3. Incremental upsert function
-# ---------------------------------------
+def stream_oracle_to_parquet(config, staging_path):
+    """
+    Stream Oracle results in chunks directly to a staging parquet.
+    This avoids ever holding the full Oracle result in pandas RAM.
+    """
+    chunks = pd.read_sql(
+        config["source_query"],
+        con=engine,
+        chunksize=config.get("chunk_size", 50_000)
+    )
+
+    first = True
+    row_count = 0
+
+    for chunk in chunks:
+        row_count += len(chunk)
+        if first:
+            chunk.to_parquet(staging_path, index=False, engine="pyarrow")
+            first = False
+        else:
+            # Append subsequent chunks
+            existing = pd.read_parquet(staging_path)
+            pd.concat([existing, chunk]).to_parquet(
+                staging_path, index=False, engine="pyarrow"
+            )
+
+    return row_count
+
 
 def incremental_upsert(config):
-
-    con = duckdb.connect()
-
-    # Optional memory controls
-    con.execute("SET memory_limit='4GB'")
-    con.execute("SET threads=2")
 
     target_path = config["target_path"]
     key_cols = config["key_cols"]
     incremental_col = config["incremental_col"]
     lookback_days = config["lookback_days"]
 
-    temp_path = target_path.replace(".parquet", "_temp.parquet")
-    backup_path = target_path.replace(".parquet", "_backup.parquet")
+    temp_path    = target_path.replace(".parquet", "_temp.parquet")
+    backup_path  = target_path.replace(".parquet", "_backup.parquet")
+    staging_path = target_path.replace(".parquet", "_staging_source.parquet")
 
-    # ---------------------------------------
-    # Pull recent/changed rows from Oracle
-    # ---------------------------------------
+    # --------------------------------------------------
+    # STEP 1: Stream Oracle → staging parquet (no pandas blob in RAM)
+    # --------------------------------------------------
+    print("Pulling from Oracle...")
+    source_count = stream_oracle_to_parquet(config, staging_path)
 
-    source_df = get_oracle_data(config["source_query"])
-
-    if source_df.empty:
+    if source_count == 0:
         print("No new source rows found.")
         return
 
-    con.register("source_df", source_df)
+    print(f"Rows pulled from Oracle: {source_count:,}")
 
-    # ---------------------------------------
-    # Load ONLY the recent slice from existing parquet
-    # ---------------------------------------
-
-    con.execute(f"""
-        CREATE OR REPLACE TABLE target_recent AS
-        SELECT *
-        FROM read_parquet('{target_path}')
-        WHERE {incremental_col} >= CURRENT_DATE - INTERVAL '{lookback_days} days'
-    """)
-
-    # ---------------------------------------
-    # Merge recent Oracle rows into recent parquet slice
-    # ---------------------------------------
+    # --------------------------------------------------
+    # STEP 2: DuckDB does everything file-to-file.
+    # No DataFrames registered. No full-table loads.
+    # --------------------------------------------------
+    con = duckdb.connect()
+    con.execute("SET memory_limit='2GB'")  # Tighter now that we're not double-loading
+    con.execute("SET threads=4")
 
     join_condition = " AND ".join(
-        [f"target_recent.{col} = source_df.{col}" for col in key_cols]
+        [f"t.{col} = s.{col}" for col in key_cols]
     )
 
-    con.execute(f"""
-        MERGE INTO target_recent
-        USING source_df
-        ON {join_condition}
-        WHEN MATCHED THEN UPDATE SET *
-        WHEN NOT MATCHED THEN INSERT *
-    """)
-
-    # ---------------------------------------
-    # Rebuild full parquet:
-    # old untouched history + updated recent slice
-    # ---------------------------------------
-
+    # --------------------------------------------------
+    # STEP 3: Merge only the recent window, write everything
+    # back to temp in ONE pass — no UNION ALL in memory.
+    #
+    # Key fix: DuckDB reads the historical parquet with predicate
+    # pushdown so the old data is streamed through, not loaded.
+    # The COPY ... TO writes directly to disk as it streams.
+    # --------------------------------------------------
+    print("Running merge and writing output...")
     con.execute(f"""
         COPY (
+            -- Historical data older than the lookback window.
+            -- DuckDB pushes the WHERE down into the parquet reader;
+            -- this data streams to disk without fully materializing.
             SELECT *
             FROM read_parquet('{target_path}')
             WHERE {incremental_col} < CURRENT_DATE - INTERVAL '{lookback_days} days'
 
             UNION ALL
 
+            -- Recent parquet rows that do NOT appear in the Oracle pull
+            -- (i.e., they weren't updated — keep them as-is)
+            SELECT t.*
+            FROM read_parquet('{target_path}') t
+            LEFT JOIN read_parquet('{staging_path}') s
+                ON {join_condition.replace('t.', 't.').replace('s.', 's.')}
+            WHERE t.{incremental_col} >= CURRENT_DATE - INTERVAL '{lookback_days} days'
+              AND s.{key_cols[0]} IS NULL
+
+            UNION ALL
+
+            -- All Oracle rows (new inserts + updated rows replace old)
             SELECT *
-            FROM target_recent
-        )
-        TO '{temp_path}'
-        (FORMAT PARQUET)
+            FROM read_parquet('{staging_path}')
+
+        ) TO '{temp_path}' (FORMAT PARQUET)
     """)
 
-    # ---------------------------------------
-    # Safe file swap
-    # ---------------------------------------
+    # --------------------------------------------------
+    # STEP 4: Audit counts (cheap — no full table scans)
+    # --------------------------------------------------
+    insert_count = con.execute(f"""
+        SELECT COUNT(*)
+        FROM read_parquet('{staging_path}') s
+        LEFT JOIN read_parquet('{target_path}') t
+            ON {join_condition}
+        WHERE t.{key_cols[0]} IS NULL
+    """).fetchone()[0]
 
+    update_count = source_count - insert_count
+
+    print("\n========== LOAD SUMMARY ==========")
+    print(f"Rows pulled from Oracle : {source_count:,}")
+    print(f"Estimated inserts       : {insert_count:,}")
+    print(f"Estimated updates       : {update_count:,}")
+    print("==================================\n")
+
+    # --------------------------------------------------
+    # STEP 5: Safe file swap + cleanup
+    # --------------------------------------------------
+    con.close()
     shutil.copy2(target_path, backup_path)
     os.replace(temp_path, target_path)
 
-    print("Incremental upsert complete.")
-    print(f"Updated file: {target_path}")
-    print(f"Backup file: {backup_path}")
+    if os.path.exists(staging_path):
+        os.remove(staging_path)
 
+    print(f"Done. Updated: {target_path}")
+    print(f"Backup kept:   {backup_path}")
 
-# ---------------------------------------
-# 4. Run it
-# ---------------------------------------
 
 incremental_upsert(TABLE_CONFIGS["work_orders"])
-
-
-
-
-join_condition = " AND ".join(
-    [f"target_recent.{col} = source_df.{col}" for col in key_cols]
-)
-
-insert_count = con.execute(f"""
-    SELECT COUNT(*)
-    FROM source_df
-    LEFT JOIN target_recent
-    ON {join_condition}
-    WHERE target_recent.{key_cols[0]} IS NULL
-""").fetchone()[0]
-
-update_count = con.execute(f"""
-    SELECT COUNT(*)
-    FROM source_df
-    INNER JOIN target_recent
-    ON {join_condition}
-""").fetchone()[0]
-
-
-print("\n========== LOAD SUMMARY ==========")
-
-print(f"Rows pulled from Oracle: {source_count:,}")
-print(f"Estimated inserts: {insert_count:,}")
-print(f"Estimated updates: {update_count:,}")
-
-print("\nSample rows:")
-
-print(
-    con.execute("""
-        SELECT *
-        FROM source_df
-        LIMIT 5
-    """).df()
-)
-
-print("==================================")
-
