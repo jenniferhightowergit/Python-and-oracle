@@ -33,31 +33,50 @@ TABLE_CONFIGS = {
 }
 
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 def stream_oracle_to_parquet(config, staging_path):
-    """
-    Stream Oracle results in chunks directly to a staging parquet.
-    This avoids ever holding the full Oracle result in pandas RAM.
-    """
     chunks = pd.read_sql(
         config["source_query"],
         con=engine,
         chunksize=config.get("chunk_size", 50_000)
     )
 
-    first = True
+    writer = None
     row_count = 0
 
-    for chunk in chunks:
-        row_count += len(chunk)
-        if first:
-            chunk.to_parquet(staging_path, index=False, engine="pyarrow")
-            first = False
-        else:
-            # Append subsequent chunks
-            existing = pd.read_parquet(staging_path)
-            pd.concat([existing, chunk]).to_parquet(
-                staging_path, index=False, engine="pyarrow"
-            )
+    try:
+        for chunk in chunks:
+            row_count += len(chunk)
+
+            # Convert to pyarrow table
+            table = pa.Table.from_pandas(chunk, preserve_index=False)
+
+            # Normalize all timestamp columns to microsecond precision.
+            # Oracle gives us 'us'; pandas wants 'ns' by default — this
+            # forces everything to 'us' so there's no collision.
+            new_fields = []
+            for field in table.schema:
+                if pa.types.is_timestamp(field.type):
+                    new_fields.append(
+                        field.with_type(pa.timestamp("us", tz=field.type.tz))
+                    )
+                else:
+                    new_fields.append(field)
+
+            table = table.cast(pa.schema(new_fields))
+
+            # Open the writer on the first chunk so the schema is
+            # derived from actual data, not guessed ahead of time.
+            if writer is None:
+                writer = pq.ParquetWriter(staging_path, table.schema)
+
+            writer.write_table(table)
+
+    finally:
+        if writer:
+            writer.close()
 
     return row_count
 
