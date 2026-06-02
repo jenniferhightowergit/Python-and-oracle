@@ -1,0 +1,56 @@
+import pandas as pd
+from itertools import product
+
+def run_preprocessing_by_month(df, date_col, preprocess_fn, output_dir="output"):
+    """
+    Runs your preprocessing function on df split by year/month.
+    
+    df           - your full dataframe
+    date_col     - name of the datetime column (e.g. 'WORK_ORDER_DATE')
+    preprocess_fn - your existing preprocessing function that takes a df
+    output_dir   - where to save each batch result
+    """
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Make sure the date column is parsed
+    df[date_col] = pd.to_datetime(df[date_col])
+    df["_year"]  = df[date_col].dt.year
+    df["_month"] = df[date_col].dt.month
+
+    batches = df[["_year", "_month"]].drop_duplicates().sort_values(["_year", "_month"])
+
+    for _, row in batches.iterrows():
+        year, month = int(row["_year"]), int(row["_month"])
+        batch_label = f"{year}_{month:02d}"
+        print(f"Processing batch: {batch_label} ...", end=" ")
+
+        try:
+            mask = (df["_year"] == year) & (df["_month"] == month)
+            batch_df = df[mask].drop(columns=["_year", "_month"]).copy()
+
+            result = preprocess_fn(batch_df)  # <-- your existing function
+
+            out_path = os.path.join(output_dir, f"preprocessed_{batch_label}.parquet")
+            result.to_parquet(out_path, index=False)
+            print(f"✓ saved {len(result)} rows → {out_path}")
+
+        except Exception as e:
+            print(f"✗ FAILED — {e}")
+            # Continues to next batch instead of crashing everything
+
+    print("\nAll batches complete.")
+
+run_preprocessing_by_month(
+    df=your_full_df,
+    date_col="WORK_ORDER_DATE",   # swap for your actual column name
+    preprocess_fn=your_preprocess_fn
+)
+
+
+import glob
+
+all_files = sorted(glob.glob("output/preprocessed_*.parquet"))
+combined = pd.concat([pd.read_parquet(f) for f in all_files], ignore_index=True)
+combined.to_parquet("output/preprocessed_all.parquet", index=False)
+
