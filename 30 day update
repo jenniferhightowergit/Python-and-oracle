@@ -138,3 +138,45 @@ def incremental_upsert(config):
 # ---------------------------------------
 
 incremental_upsert(TABLE_CONFIGS["work_orders"])
+
+
+
+
+join_condition = " AND ".join(
+    [f"target_recent.{col} = source_df.{col}" for col in key_cols]
+)
+
+insert_count = con.execute(f"""
+    SELECT COUNT(*)
+    FROM source_df
+    LEFT JOIN target_recent
+    ON {join_condition}
+    WHERE target_recent.{key_cols[0]} IS NULL
+""").fetchone()[0]
+
+update_count = con.execute(f"""
+    SELECT COUNT(*)
+    FROM source_df
+    INNER JOIN target_recent
+    ON {join_condition}
+""").fetchone()[0]
+
+
+print("\n========== LOAD SUMMARY ==========")
+
+print(f"Rows pulled from Oracle: {source_count:,}")
+print(f"Estimated inserts: {insert_count:,}")
+print(f"Estimated updates: {update_count:,}")
+
+print("\nSample rows:")
+
+print(
+    con.execute("""
+        SELECT *
+        FROM source_df
+        LIMIT 5
+    """).df()
+)
+
+print("==================================")
+
