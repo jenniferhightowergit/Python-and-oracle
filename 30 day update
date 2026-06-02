@@ -3,7 +3,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pandas as pd
 import os
-from datetime import datetime
+from fastparquet import write as fp_write
 from sqlalchemy import create_engine
 
 engine = create_engine(
@@ -17,10 +17,7 @@ TABLE_CONFIGS = {
             FROM work_orders
             WHERE work_order_update_date >= SYSDATE - 30
         """,
-        # Directory instead of a single file.
-        # DuckDB reads all parquet files in the folder as one dataset.
-        "target_dir": r"//sharedrive/staging/work_orders",
-
+        "target_path": r"//sharedrive/staging/work_orders.parquet",
         "key_cols": ["work_order_id"],
         "incremental_col": "work_order_update_date",
         "chunk_size": 50_000
@@ -64,13 +61,11 @@ def stream_oracle_to_parquet(config, staging_path):
 
 
 def incremental_append(config):
-    target_dir = config["target_dir"]
-    key_cols   = config["key_cols"]
+    target_path    = config["target_path"]
+    key_cols       = config["key_cols"]
+    incremental_col = config["incremental_col"]
 
-    os.makedirs(target_dir, exist_ok=True)
-
-    staging_path = os.path.join(target_dir, "_staging.parquet")
-    existing_pattern = os.path.join(target_dir, "*.parquet")
+    staging_path = target_path.replace(".parquet", "_staging.parquet")
 
     # --------------------------------------------------
     # STEP 1: Pull Oracle → staging file
@@ -87,8 +82,8 @@ def incremental_append(config):
     print(f"Rows pulled from Oracle: {source_count:,}")
 
     # --------------------------------------------------
-    # STEP 2: Anti-join to find only rows not already
-    # in the parquet directory. No full file rebuild.
+    # STEP 2: Anti-join against last 60 days of parquet
+    # to find only rows not already in the file
     # --------------------------------------------------
     con = duckdb.connect()
     con.execute("SET memory_limit='2GB'")
@@ -98,41 +93,25 @@ def incremental_append(config):
         [f"s.{col} = t.{col}" for col in key_cols]
     )
 
-    # Check if any existing parquet files are present
-    existing_files = [
-        f for f in os.listdir(target_dir)
-        if f.endswith(".parquet") and not f.startswith("_")
-    ]
-
-    if existing_files:
-        new_rows_df = con.execute(f"""
-            SELECT s.*
-            FROM read_parquet('{staging_path}') s
-            LEFT JOIN read_parquet('{existing_pattern}') t
-                ON {join_condition}
-            WHERE t.{key_cols[0]} IS NULL
-        """).df()
-    else:
-        # No existing data yet — everything is new
-        new_rows_df = con.execute(f"""
-            SELECT * FROM read_parquet('{staging_path}')
-        """).df()
+    new_rows_df = con.execute(f"""
+        SELECT s.*
+        FROM read_parquet('{staging_path}') s
+        LEFT JOIN (
+            SELECT * FROM read_parquet('{target_path}')
+            WHERE {incremental_col} >= CURRENT_DATE - INTERVAL '60 days'
+        ) t ON {join_condition}
+        WHERE t.{key_cols[0]} IS NULL
+    """).df()
 
     insert_count = len(new_rows_df)
     duplicate_count = source_count - insert_count
 
     # --------------------------------------------------
-    # STEP 3: Write ONLY new rows as a small dated file.
-    # Nothing gets rewritten. No temp swap needed.
+    # STEP 3: Append only new rows to existing parquet
     # --------------------------------------------------
     if insert_count > 0:
-        datestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        new_file_path = os.path.join(
-            target_dir, f"work_orders_{datestamp}.parquet"
-        )
-        new_table = pa.Table.from_pandas(new_rows_df, preserve_index=False)
-        pq.write_table(new_table, new_file_path)
-        print(f"New rows written to: {new_file_path}")
+        fp_write(target_path, new_rows_df, append=True)
+        print(f"New rows appended to: {target_path}")
     else:
         print("No new rows to append — everything already exists.")
 
