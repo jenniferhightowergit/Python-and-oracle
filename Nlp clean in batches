@@ -5,6 +5,73 @@ import re
 import traceback
 from pathlib import Path
 
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import re
+import traceback
+import gc
+from pathlib import Path
+
+INPUT_FILE  = Path("Z:/your/folder/work_orders.parquet")
+OUTPUT_FILE = Path("Z:/your/folder/work_orders_cleaned.parquet")
+
+BATCH_SIZE = 2_000
+
+# ============================================================
+# READ THE PARQUET IN CHUNKS — no full load into memory
+# ============================================================
+
+parquet_file = pq.ParquetFile(INPUT_FILE)
+writer = None
+batch_num = 0
+
+for batch in parquet_file.iter_batches(batch_size=BATCH_SIZE):
+    batch_num += 1
+    print(f"\nProcessing batch {batch_num}...")
+
+    try:
+        # Convert just this chunk to pandas
+        df = batch.to_pandas()
+        print(f"  Rows loaded: {len(df):,}")
+
+        # --------------------------------------------------------
+        # YOUR CLEANING CODE GOES HERE
+        # --------------------------------------------------------
+
+        print(f"  Cleaning done")
+
+        output = df[["fr_id", "wr_comment", "cleaned_comment"]]
+
+        table = pa.Table.from_pandas(output, preserve_index=False)
+        if writer is None:
+            writer = pq.ParquetWriter(OUTPUT_FILE, table.schema)
+            print("  Writer opened")
+        writer.write_table(table)
+        print(f"  ✓ Batch {batch_num} written")
+
+    except Exception as e:
+        print(f"  ✗ FAILED: {e}")
+        traceback.print_exc()
+
+    finally:
+        del df, output, table
+        gc.collect()
+
+if writer:
+    writer.close()
+    print(f"\nAll done! Saved to: {OUTPUT_FILE}")
+else:
+    print("No data was written.")
+
+
+
+
+
+
+
+
 # ============================================================
 # STEP 1: SET YOUR FILE PATHS AND COLUMN NAMES
 # ============================================================
