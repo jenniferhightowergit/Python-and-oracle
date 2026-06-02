@@ -1,7 +1,9 @@
 import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pandas as pd
 import os
-import shutil
+from datetime import datetime
 from sqlalchemy import create_engine
 
 engine = create_engine(
@@ -15,28 +17,19 @@ TABLE_CONFIGS = {
             FROM work_orders
             WHERE work_order_update_date >= SYSDATE - 30
         """,
-        # FIX: Changed to 30 days to match your stated intent.
-        # Your original had 60 days here AND in lookback_days,
-        # meaning you were pulling and comparing the same window — redundant.
+        # Directory instead of a single file.
+        # DuckDB reads all parquet files in the folder as one dataset.
+        "target_dir": r"//sharedrive/staging/work_orders",
 
-        "target_path": r"//sharedrive/staging/work_orders.parquet",
         "key_cols": ["work_order_id"],
         "incremental_col": "work_order_update_date",
-        "lookback_days": 60,
-        # Keep 60 days as the comparison window in the parquet.
-        # Oracle pulls last 30 days; parquet window is 60 days.
-        # This gives you overlap buffer for late-arriving updates.
-
         "chunk_size": 50_000
-        # FIX: Added chunking so Oracle reads don't slam memory at once.
     }
 }
 
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-
 def stream_oracle_to_parquet(config, staging_path):
+    """Stream Oracle → staging parquet in chunks. No full result in RAM."""
     chunks = pd.read_sql(
         config["source_query"],
         con=engine,
@@ -49,31 +42,20 @@ def stream_oracle_to_parquet(config, staging_path):
     try:
         for chunk in chunks:
             row_count += len(chunk)
-
-            # Convert to pyarrow table
             table = pa.Table.from_pandas(chunk, preserve_index=False)
 
-            # Normalize all timestamp columns to microsecond precision.
-            # Oracle gives us 'us'; pandas wants 'ns' by default — this
-            # forces everything to 'us' so there's no collision.
+            # Normalize timestamps to microseconds (Oracle → pandas precision fix)
             new_fields = []
             for field in table.schema:
                 if pa.types.is_timestamp(field.type):
-                    new_fields.append(
-                        field.with_type(pa.timestamp("us", tz=field.type.tz))
-                    )
+                    new_fields.append(field.with_type(pa.timestamp("us", tz=field.type.tz)))
                 else:
                     new_fields.append(field)
-
             table = table.cast(pa.schema(new_fields))
 
-            # Open the writer on the first chunk so the schema is
-            # derived from actual data, not guessed ahead of time.
             if writer is None:
                 writer = pq.ParquetWriter(staging_path, table.schema)
-
             writer.write_table(table)
-
     finally:
         if writer:
             writer.close()
@@ -81,110 +63,90 @@ def stream_oracle_to_parquet(config, staging_path):
     return row_count
 
 
-def incremental_upsert(config):
+def incremental_append(config):
+    target_dir = config["target_dir"]
+    key_cols   = config["key_cols"]
 
-    target_path = config["target_path"]
-    key_cols = config["key_cols"]
-    incremental_col = config["incremental_col"]
-    lookback_days = config["lookback_days"]
+    os.makedirs(target_dir, exist_ok=True)
 
-    temp_path    = target_path.replace(".parquet", "_temp.parquet")
-    backup_path  = target_path.replace(".parquet", "_backup.parquet")
-    staging_path = target_path.replace(".parquet", "_staging_source.parquet")
+    staging_path = os.path.join(target_dir, "_staging.parquet")
+    existing_pattern = os.path.join(target_dir, "*.parquet")
 
     # --------------------------------------------------
-    # STEP 1: Stream Oracle → staging parquet (no pandas blob in RAM)
+    # STEP 1: Pull Oracle → staging file
     # --------------------------------------------------
     print("Pulling from Oracle...")
     source_count = stream_oracle_to_parquet(config, staging_path)
 
     if source_count == 0:
-        print("No new source rows found.")
+        print("No new rows found.")
+        if os.path.exists(staging_path):
+            os.remove(staging_path)
         return
 
     print(f"Rows pulled from Oracle: {source_count:,}")
 
     # --------------------------------------------------
-    # STEP 2: DuckDB does everything file-to-file.
-    # No DataFrames registered. No full-table loads.
+    # STEP 2: Anti-join to find only rows not already
+    # in the parquet directory. No full file rebuild.
     # --------------------------------------------------
     con = duckdb.connect()
-    con.execute("SET memory_limit='2GB'")  # Tighter now that we're not double-loading
+    con.execute("SET memory_limit='2GB'")
     con.execute("SET threads=4")
 
     join_condition = " AND ".join(
-        [f"t.{col} = s.{col}" for col in key_cols]
+        [f"s.{col} = t.{col}" for col in key_cols]
     )
 
-    # --------------------------------------------------
-    # STEP 3: Merge only the recent window, write everything
-    # back to temp in ONE pass — no UNION ALL in memory.
-    #
-    # Key fix: DuckDB reads the historical parquet with predicate
-    # pushdown so the old data is streamed through, not loaded.
-    # The COPY ... TO writes directly to disk as it streams.
-    # --------------------------------------------------
-    print("Running merge and writing output...")
-    con.execute(f"""
-        COPY (
-            -- Historical data older than the lookback window.
-            -- DuckDB pushes the WHERE down into the parquet reader;
-            -- this data streams to disk without fully materializing.
-            SELECT *
-            FROM read_parquet('{target_path}')
-            WHERE {incremental_col} < CURRENT_DATE - INTERVAL '{lookback_days} days'
+    # Check if any existing parquet files are present
+    existing_files = [
+        f for f in os.listdir(target_dir)
+        if f.endswith(".parquet") and not f.startswith("_")
+    ]
 
-            UNION ALL
+    if existing_files:
+        new_rows_df = con.execute(f"""
+            SELECT s.*
+            FROM read_parquet('{staging_path}') s
+            LEFT JOIN read_parquet('{existing_pattern}') t
+                ON {join_condition}
+            WHERE t.{key_cols[0]} IS NULL
+        """).df()
+    else:
+        # No existing data yet — everything is new
+        new_rows_df = con.execute(f"""
+            SELECT * FROM read_parquet('{staging_path}')
+        """).df()
 
-            -- Recent parquet rows that do NOT appear in the Oracle pull
-            -- (i.e., they weren't updated — keep them as-is)
-            SELECT t.*
-            FROM read_parquet('{target_path}') t
-            LEFT JOIN read_parquet('{staging_path}') s
-                ON {join_condition.replace('t.', 't.').replace('s.', 's.')}
-            WHERE t.{incremental_col} >= CURRENT_DATE - INTERVAL '{lookback_days} days'
-              AND s.{key_cols[0]} IS NULL
-
-            UNION ALL
-
-            -- All Oracle rows (new inserts + updated rows replace old)
-            SELECT *
-            FROM read_parquet('{staging_path}')
-
-        ) TO '{temp_path}' (FORMAT PARQUET)
-    """)
+    insert_count = len(new_rows_df)
+    duplicate_count = source_count - insert_count
 
     # --------------------------------------------------
-    # STEP 4: Audit counts (cheap — no full table scans)
+    # STEP 3: Write ONLY new rows as a small dated file.
+    # Nothing gets rewritten. No temp swap needed.
     # --------------------------------------------------
-    insert_count = con.execute(f"""
-        SELECT COUNT(*)
-        FROM read_parquet('{staging_path}') s
-        LEFT JOIN read_parquet('{target_path}') t
-            ON {join_condition}
-        WHERE t.{key_cols[0]} IS NULL
-    """).fetchone()[0]
+    if insert_count > 0:
+        datestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        new_file_path = os.path.join(
+            target_dir, f"work_orders_{datestamp}.parquet"
+        )
+        new_table = pa.Table.from_pandas(new_rows_df, preserve_index=False)
+        pq.write_table(new_table, new_file_path)
+        print(f"New rows written to: {new_file_path}")
+    else:
+        print("No new rows to append — everything already exists.")
 
-    update_count = source_count - insert_count
+    # --------------------------------------------------
+    # STEP 4: Cleanup staging file
+    # --------------------------------------------------
+    con.close()
+    os.remove(staging_path)
 
     print("\n========== LOAD SUMMARY ==========")
     print(f"Rows pulled from Oracle : {source_count:,}")
-    print(f"Estimated inserts       : {insert_count:,}")
-    print(f"Estimated updates       : {update_count:,}")
+    print(f"New rows appended       : {insert_count:,}")
+    print(f"Duplicates skipped      : {duplicate_count:,}")
     print("==================================\n")
 
-    # --------------------------------------------------
-    # STEP 5: Safe file swap + cleanup
-    # --------------------------------------------------
-    con.close()
-    shutil.copy2(target_path, backup_path)
-    os.replace(temp_path, target_path)
 
-    if os.path.exists(staging_path):
-        os.remove(staging_path)
-
-    print(f"Done. Updated: {target_path}")
-    print(f"Backup kept:   {backup_path}")
-
-
-incremental_upsert(TABLE_CONFIGS["work_orders"])
+incremental_append(TABLE_CONFIGS["work_orders"])
