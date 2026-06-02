@@ -2,103 +2,34 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import re
+import traceback
+from pathlib import Path
 
-def batch_preprocess(
-    input_parquet,
-    output_parquet,
-    id_col,
-    comment_col,
-    batch_size=10_000
-):
-    print(f"Loading {input_parquet}...")
-    df = pd.read_parquet(input_parquet, columns=[id_col, comment_col])
-    total = len(df)
-    print(f"Total rows: {total:,}")
+# ============================================================
+# STEP 1: SET YOUR FILE PATHS AND COLUMN NAMES
+# ============================================================
 
-    writer = None  # ParquetWriter will be opened on the first batch
+INPUT_FILE  = Path("Z:/your/folder/work_orders.parquet")
+OUTPUT_FILE = Path("Z:/your/folder/work_orders_cleaned.parquet")
 
-    for start in range(0, total, batch_size):
-        end = min(start + batch_size, total)
-        print(f"Processing rows {start:,}–{end:,} ...", end=" ", flush=True)
+WORK_ORDER_ID_COL = "WORK_ORDER_ID"
+COMMENT_COL       = "TECH_COMMENT"
+BATCH_SIZE        = 10_000
 
-        try:
-            batch = df.iloc[start:end].copy()
+# ============================================================
+# STEP 2: LOAD YOUR DATA
+# ============================================================
 
-            # ----------------------------------------------------------------
-            # COMMENT CLEANING STARTS HERE
-            # Replace everything below with your actual preprocessing steps
-            # ----------------------------------------------------------------
+print("Loading data...")
+df = pd.read_parquet(INPUT_FILE)
+total_rows = len(df)
+print(f"Total rows loaded: {total_rows:,}")
 
-            # Lowercase
-            batch["cleaned_comment"] = batch[comment_col].str.lower()
+# ============================================================
+# STEP 3: PROCESS IN BATCHES
+# ============================================================
 
-            # Strip leading/trailing whitespace
-            batch["cleaned_comment"] = batch["cleaned_comment"].str.strip()
-
-            # Remove special characters, keep letters/numbers/spaces
-            batch["cleaned_comment"] = batch["cleaned_comment"].apply(
-                lambda x: re.sub(r"[^a-z0-9\s]", "", str(x)) if pd.notna(x) else x
-            )
-
-            # Collapse multiple spaces into one
-            batch["cleaned_comment"] = batch["cleaned_comment"].apply(
-                lambda x: re.sub(r"\s+", " ", str(x)) if pd.notna(x) else x
-            )
-
-            # Replace blanks/nulls that slipped through with NaN
-            batch["cleaned_comment"] = batch["cleaned_comment"].replace("", pd.NA)
-
-            # ----------------------------------------------------------------
-            # COMMENT CLEANING ENDS HERE
-            # ----------------------------------------------------------------
-
-            # Keep only the ID and cleaned comment for output
-            result = batch[[id_col, "cleaned_comment"]]
-
-            # ----------------------------------------------------------------
-            # APPEND TO PARQUET STARTS HERE
-            # Each batch gets written to the output parquet file here.
-            # The ParquetWriter keeps the file open and appends each batch
-            # as a new row group — no temp files, no concat at the end.
-            # ----------------------------------------------------------------
-
-            table = pa.Table.from_pandas(result, preserve_index=False)
-
-            if writer is None:
-                # First batch — open the writer and define the file schema
-                writer = pq.ParquetWriter(output_parquet, table.schema)
-
-            writer.write_table(table)  # <-- this is where the batch gets appended
-
-            # ----------------------------------------------------------------
-            # APPEND TO PARQUET ENDS HERE
-            # ----------------------------------------------------------------
-
-            print(f"✓ {len(result):,} rows appended")
-
-        except Exception as e:
-            print(f"✗ FAILED — {e}")
-            # Bad batch gets logged and skipped; rest of the run continues
-
-    if writer:
-        writer.close()  # Finalizes and closes the parquet file
-        print(f"\nDone. Cleaned comments saved to: {output_parquet}")
-    else:
-        print("No data was written.")
-
-
-# --- Run it ---
-batch_preprocess(
-    input_parquet="work_orders.parquet",
-    output_parquet="work_orders_cleaned.parquet",
-    id_col="WORK_ORDER_ID",
-    comment_col="TECH_COMMENT",
-    batch_size=10_000
-
-
-
-)
-
+writer = None
 
 for start in range(0, total_rows, BATCH_SIZE):
     end = min(start + BATCH_SIZE, total_rows)
@@ -108,8 +39,18 @@ for start in range(0, total_rows, BATCH_SIZE):
         batch = df.iloc[start:end].copy()
         print(f"  Batch loaded: {len(batch):,} rows")
 
-        # Your cleaning code here
+        # --------------------------------------------------------
+        # PUT YOUR CLEANING CODE HERE
+        # --------------------------------------------------------
         batch["cleaned_comment"] = batch[COMMENT_COL].str.lower().str.strip()
+        batch["cleaned_comment"] = batch["cleaned_comment"].apply(
+            lambda x: re.sub(r"[^a-z0-9\s]", "", str(x)) if pd.notna(x) else x
+        )
+        batch["cleaned_comment"] = batch["cleaned_comment"].replace("", pd.NA)
+        # --------------------------------------------------------
+        # END OF CLEANING CODE
+        # --------------------------------------------------------
+
         print(f"  Cleaning done. Columns: {batch.columns.tolist()}")
 
         output_batch = batch[[WORK_ORDER_ID_COL, COMMENT_COL, "cleaned_comment"]]
@@ -125,6 +66,14 @@ for start in range(0, total_rows, BATCH_SIZE):
     except Exception as e:
         print(f"  ✗ BATCH FAILED at rows {start:,} to {end:,}")
         print(f"  Error: {e}")
-        import traceback
-        traceback.print_exc()  # prints the full error with line numbers
+        traceback.print_exc()
 
+# ============================================================
+# STEP 4: CLOSE THE FILE
+# ============================================================
+
+if writer:
+    writer.close()
+    print(f"\nAll done! Saved to: {OUTPUT_FILE}")
+else:
+    print("No data was written.")
