@@ -1,86 +1,40 @@
-import gc
-
-
-        con.execute("CHECKPOINT;")  # flushes DuckDB work to disk when using a DB file
-        gc.collect()
-
-
 import duckdb
-from pathlib import Path
-import math
 import gc
 
+con = duckdb.connect("warehouse.duckdb")
 
-def run_duckdb_meter_batches(
-    duckdb_path,
-    meter_id_query,
-    batch_sql_template,
-    output_folder,
-    batch_size=100,
-    meter_id_col="meter_id",
-    memory_limit="4GB",
-    temp_directory=None,
-):
-    output_folder = Path(output_folder)
-    output_folder.mkdir(parents=True, exist_ok=True)
+meter_ids = (
+    meter_sample["meter_id"]
+    .dropna()
+    .unique()
+    .tolist()
+)
 
-    con = duckdb.connect(duckdb_path)
+batch_size = 500
 
-    con.execute(f"SET memory_limit='{memory_limit}';")
+for i in range(0, len(meter_ids), batch_size):
 
-    if temp_directory:
-        Path(temp_directory).mkdir(parents=True, exist_ok=True)
-        con.execute(f"SET temp_directory='{Path(temp_directory).as_posix()}';")
+    batch = meter_ids[i:i+batch_size]
 
-    meter_ids = [
-        row[0]
-        for row in con.execute(meter_id_query).fetchall()
-        if row[0] is not None
-    ]
+    meter_filter = ",".join(
+        f"'{x}'" for x in batch
+    )
 
-    total_batches = math.ceil(len(meter_ids) / batch_size)
+    sql = f"""
+    COPY (
+        SELECT *
+        FROM my_big_table
+        WHERE meter_id IN ({meter_filter})
+    )
+    TO 'output/batch_{i}.parquet'
+    (FORMAT PARQUET);
+    """
 
-    for batch_num, start in enumerate(range(0, len(meter_ids), batch_size), start=1):
-        batch_ids = meter_ids[start:start + batch_size]
+    print(f"Running batch {i:,} to {i+len(batch):,}")
 
-        formatted_ids = ", ".join(f"'{str(x)}'" for x in batch_ids)
-        meter_filter = f"{meter_id_col} IN ({formatted_ids})"
+    con.execute(sql)
 
-        batch_sql = batch_sql_template.format(meter_filter=meter_filter)
-
-        output_file = output_folder / f"batch_{batch_num:05d}.parquet"
-
-        print(f"Running batch {batch_num:,}/{total_batches:,}")
-
-        con.execute(f"""
-            COPY (
-                {batch_sql}
-            )
-            TO '{output_file.as_posix()}'
-            (FORMAT PARQUET);
-        """)
-
-        del batch_ids, formatted_ids, meter_filter, batch_sql, output_file
-        gc.collect()
-
-    con.close()
+    del batch
     gc.collect()
 
-
-run_duckdb_meter_batches(
-    duckdb_path=r"C:\data\warehouse.duckdb",
-    meter_id_query="""
-        SELECT DISTINCT meter_id
-        FROM meter_sample
-        WHERE meter_id IS NOT NULL
-    """,
-    batch_sql_template="""
-        SELECT *
-        FROM big_meter_table
-        WHERE {meter_filter}
-    """,
-    output_folder=r"C:\data\batched_output",
-    batch_size=100,
-    memory_limit="4GB",
-    temp_directory=r"C:\duckdb_temp"
-)
+con.close()
